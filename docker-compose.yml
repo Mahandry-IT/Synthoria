@@ -8,6 +8,11 @@ x-piper-image: &piper-image ghcr.io/mahandry-it/synthoria-piper:${SYNTHORIA_IMAG
 # Construite depuis POSTGRES_* : mot de passe obligatoire, sans caractère réservé d'URL (@ : / ? #).
 x-database-url: &database-url postgresql+asyncpg://${POSTGRES_USER:-synthoria}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD doit être défini dans .env}@postgres:5432/${POSTGRES_DB:-synthoria}
 
+# Seuls ces conteneurs sont mis à jour par Watchtower (filtrage par label + scope).
+x-watchtower-labels: &watchtower-labels
+  com.centurylinklabs.watchtower.enable: "true"
+  com.centurylinklabs.watchtower.scope: synthoria
+
 services:
   studio:
     image: ghcr.io/mahandry-it/synthoria-studio:${SYNTHORIA_IMAGE_TAG:-latest}
@@ -17,6 +22,10 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    labels:
+      <<: *watchtower-labels
+      # Watchtower ne lit pas depends_on : redémarre le studio quand l'api est mise à jour.
+      com.centurylinklabs.watchtower.depends-on: synthoria-api-1
     restart: unless-stopped
 
   api:
@@ -47,6 +56,7 @@ services:
         condition: service_started
       postgres:
         condition: service_healthy
+    labels: *watchtower-labels
     restart: unless-stopped
     volumes:
       - chroma-data:/data
@@ -78,6 +88,7 @@ services:
     healthcheck:
       disable: true   # pas d'HTTP dans le worker : ne pas hériter du healthcheck /health de l'image
     cpus: 1.5         # borne le CPU de la synthèse vocale pour préserver l'api
+    labels: *watchtower-labels
     restart: unless-stopped
     stop_grace_period: 60s   # laisse le worker finir son étape sur SIGTERM
     volumes:
@@ -101,6 +112,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    labels: *watchtower-labels
     restart: unless-stopped
 
   piper-init:
@@ -175,6 +187,25 @@ services:
     image: ghcr.io/chroma-core/chroma:1.5.9
     volumes:
       - chroma-data:/chroma/chroma
+    restart: unless-stopped
+
+  watchtower:
+    image: nickfedor/watchtower:1.23.0
+    volumes:
+      # Accès au démon Docker (équivaut à root sur l'hôte) : image épinglée, filtrage par label.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_SCOPE: synthoria
+      WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-300}
+      WATCHTOWER_CLEANUP: "true"
+      # Aligné sur stop_grace_period du worker : Watchtower ignore celui du compose.
+      WATCHTOWER_TIMEOUT: ${WATCHTOWER_TIMEOUT:-60s}
+      WATCHTOWER_MONITOR_ONLY: ${WATCHTOWER_MONITOR_ONLY:-false}
+      WATCHTOWER_NOTIFICATION_URL: ${WATCHTOWER_NOTIFICATION_URL:-}
+      TZ: ${TZ:-Europe/Paris}
+    labels:
+      com.centurylinklabs.watchtower.scope: synthoria   # pas de label enable : ne se met pas à jour lui-même
     restart: unless-stopped
 
 volumes:
