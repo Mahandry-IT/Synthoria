@@ -1,0 +1,186 @@
+# Synthoria — déploiement complet (LLM + Studio) à partir des images publiées sur GHCR.
+# Configuration : copier .env.example en .env (voir README).
+name: synthoria
+
+x-llm-image: &llm-image ghcr.io/mahandry-it/synthoria-llm:${SYNTHORIA_IMAGE_TAG:-latest}
+x-piper-image: &piper-image ghcr.io/mahandry-it/synthoria-piper:${SYNTHORIA_IMAGE_TAG:-latest}
+
+# Construite depuis POSTGRES_* : mot de passe obligatoire, sans caractère réservé d'URL (@ : / ? #).
+x-database-url: &database-url postgresql+asyncpg://${POSTGRES_USER:-synthoria}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD doit être défini dans .env}@postgres:5432/${POSTGRES_DB:-synthoria}
+
+services:
+  studio:
+    image: ghcr.io/mahandry-it/synthoria-studio:${SYNTHORIA_IMAGE_TAG:-latest}
+    # NEXT_PUBLIC_API_URL=http://api:8000 est figé au build de l'image : le service API doit s'appeler `api`.
+    ports:
+      - "${STUDIO_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    image: *llm-image
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - .env
+    dns:
+      - ${DNS_PRIMARY:-8.8.8.8}
+      - ${DNS_SECONDARY:-1.1.1.1}
+    environment:
+      PYTHONUNBUFFERED: 1
+      OLLAMA_BASE_URL: http://ollama:11435
+      OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-llama3.2}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      CHROMA_PERSIST_DIRECTORY: /data/chroma
+      # Part de GEMINI_RPM_LIMIT réservée à l'api (interactive) ; le reste au worker.
+      GEMINI_RPM_SHARE: ${GEMINI_RPM_SHARE_API:-0.7}
+      DATABASE_URL: *database-url
+      MEDIA_STORAGE_DIR: /data/media
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully   # modèles (llm + embedding) présents avant le démarrage
+      chroma:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - chroma-data:/data
+      - podcast-data:/data/podcasts   # partagé avec le worker : l'api sert les MP3 produits par lui
+      - media-data:/data/media        # images ré-hébergées, servies par GET /media/{id}
+
+  worker:
+    image: *llm-image
+    command: ["python", "-m", "app.workers.podcast_worker"]
+    env_file:
+      - .env
+    dns:
+      - ${DNS_PRIMARY:-8.8.8.8}
+      - ${DNS_SECONDARY:-1.1.1.1}
+    environment:
+      PYTHONUNBUFFERED: 1
+      GEMINI_RPM_SHARE: ${GEMINI_RPM_SHARE_WORKER:-0.3}
+      DATABASE_URL: *database-url
+      PODCAST_TTS_BASE_URL: http://piper:5000
+      PODCAST_STORAGE_DIR: /data/podcasts
+      MEDIA_STORAGE_DIR: /data/media
+    depends_on:
+      api:
+        condition: service_healthy   # l'api crée le schéma Postgres au démarrage (create_all)
+      postgres:
+        condition: service_healthy
+      piper:
+        condition: service_healthy
+    healthcheck:
+      disable: true   # pas d'HTTP dans le worker : ne pas hériter du healthcheck /health de l'image
+    cpus: 1.5         # borne le CPU de la synthèse vocale pour préserver l'api
+    restart: unless-stopped
+    stop_grace_period: 60s   # laisse le worker finir son étape sur SIGTERM
+    volumes:
+      - podcast-data:/data/podcasts
+      - media-data:/data/media
+
+  piper:
+    image: *piper-image
+    environment:
+      PIPER_DEFAULT_VOICE: ${PODCAST_TTS_MODEL:-fr_FR-upmc-medium}
+    expose:
+      - "5000"
+    depends_on:
+      piper-init:
+        condition: service_completed_successfully
+    volumes:
+      - piper-voices:/voices
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5000), 2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  piper-init:
+    image: *piper-image
+    # Télécharge le modèle de voix (upmc : 2 locuteurs, HOST et EXPERT via PODCAST_VOICE_*).
+    command: ["download", "${PODCAST_TTS_MODEL:-fr_FR-upmc-medium}"]
+    volumes:
+      - piper-voices:/voices
+
+  ollama:
+    image: ollama/ollama:0.34.2
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11435   # port attendu par l'api (OLLAMA_BASE_URL)
+    command: ["serve"]
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    # GPU NVIDIA : décommenter.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  ollama-init:
+    image: ollama/ollama:0.34.2
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # Chaque modèle est tiré indépendamment avec retries ; échec si l'un reste absent.
+    command:
+      - |
+        for model in ${OLLAMA_DEFAULT_MODEL:-llama3.2} ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}; do
+          ok=0
+          for i in 1 2 3 4 5; do
+            ollama pull "$$model" && ok=1 && break
+            echo "pull $$model échoué (tentative $$i/5)"; sleep 5
+          done
+          [ "$$ok" = 1 ] || exit 1
+        done
+    environment:
+      OLLAMA_HOST: http://ollama:11435
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: on-failure
+
+  postgres:
+    image: postgres:16.15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-synthoria}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD doit être défini dans .env}
+      POSTGRES_DB: ${POSTGRES_DB:-synthoria}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-synthoria} -d ${POSTGRES_DB:-synthoria}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  chroma:
+    image: ghcr.io/chroma-core/chroma:1.5.9
+    volumes:
+      - chroma-data:/chroma/chroma
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
+  chroma-data:
+  postgres-data:
+  piper-voices:
+  podcast-data:
+  media-data:
