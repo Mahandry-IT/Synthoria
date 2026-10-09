@@ -62,11 +62,19 @@ Une fois les services `healthy` (`make ps`) :
 ## Mise à jour automatique
 
 ```
-push sur master (LLM) / main (Studio)
-  → CI : tests → build → push GHCR (tags latest + sha-<7>)
+push sur develop          → CI : tests → build → push GHCR (tags develop + sha-<7>)
+push sur master / main    → CI : tests → build → push GHCR (tags latest + sha-<7>)
   → Watchtower (toutes les WATCHTOWER_POLL_INTERVAL secondes) détecte le nouveau digest
   → recrée uniquement studio, api, worker et piper ; postgres, ollama et chroma ne bougent pas
 ```
+
+### Stack de test et stack de production
+
+Les dépôts LLM et Studio suivent le flux `develop` → `master`/`main` : les branches de travail fusionnent dans `develop`, puis une PR `develop` → `master`/`main` livre en production.
+
+- **Stack de test** : `SYNTHORIA_IMAGE_TAG=develop` dans le `.env`. Watchtower y installe chaque version verte de `develop` ; c'est là qu'on valide la stack complète avant de livrer.
+- **Stack de production** : `SYNTHORIA_IMAGE_TAG=latest`. Seules les fusions sur `master`/`main` y arrivent.
+- Une seule stack par hôte (nom de projet, scope Watchtower et ports fixes) : pour tester `develop` sur la machine de production, `make rollback TAG=develop` puis, une fois validé, `make rollback TAG=latest` (Windows : `./synthoria.ps1 rollback develop`).
 
 - Watchtower ne surveille que les conteneurs portant `com.centurylinklabs.watchtower.enable=true` **et** le scope `synthoria` ; il ne touche à aucun autre conteneur de l'hôte.
 - Le studio est redémarré après une mise à jour de l'api (label `depends-on`).
